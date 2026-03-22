@@ -205,6 +205,15 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+// KIVI_2: Custom 2-bit KV cache quantization (asymmetric)
+#define QK_KIVI_2 32
+typedef struct {
+    ggml_half d;               // Scale: (max - min) / 3
+    ggml_half m;               // Zero-point: min value (asymmetric)
+    uint8_t qs[QK_KIVI_2/16];  // 32 × 2-bit values packed (8 bytes)
+} block_kivi_2;
+static_assert(sizeof(block_kivi_2) == 2*sizeof(ggml_half) + QK_KIVI_2/16, "wrong kivi_2 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
