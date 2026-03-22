@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-io.h"
+#include "../ggml/src/ggml-quants.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -36,8 +37,6 @@ llama_kv_cache::llama_kv_cache(
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
-    const uint32_t n_layer_kv = hparams.n_layer_kv();
-
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -51,7 +50,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
+                /*.mem_size   =*/ 4ull * 1024 * 1024,
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -72,8 +71,12 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
 
     v_heads.resize(n_stream);
+    k_recent_count.resize(n_stream);
+    k_quant_count.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_heads[s] = 0;
+        k_recent_count[s] = 0;
+        k_quant_count[s] = 0;
     }
 
     v_cells.resize(n_stream);
@@ -85,7 +88,6 @@ llama_kv_cache::llama_kv_cache(
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
 
     if (n_stream > 1) {
-        seq_to_stream.resize(n_stream, 0);
         for (uint32_t s = 0; s < n_stream; ++s) {
             seq_to_stream[s] = s;
         }
@@ -135,23 +137,28 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        const uint32_t k_size = std::min(kv_size, residual_window + 32);
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, k_size, n_stream) : nullptr;
+        ggml_tensor * k_quant = has_k ? ggml_new_tensor_3d(ctx, GGML_TYPE_KIVI_2, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
+        has_k && ggml_format_name(k_quant, "cache_k_quant_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
         std::vector<ggml_tensor *> k_stream;
+        std::vector<ggml_tensor *> k_quant_stream;
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, k_size, k->nb[1], s*k->nb[2]) : nullptr);
+            k_quant_stream.push_back(has_k ? ggml_view_2d(ctx, k_quant, n_embd_k_gqa, kv_size, k_quant->nb[1], s*k_quant->nb[2]) : nullptr);
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, k_quant, k_quant_stream });
     }
 
     if (reuse) {
@@ -217,6 +224,8 @@ void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
+        k_recent_count[s] = 0;
+        k_quant_count[s] = 0;
     }
 
     if (data) {
@@ -630,6 +639,41 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
     auto * sched = lctx->get_sched();
 
+    // KIVI_2 eviction loop
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        while (k_recent_count[s] >= residual_window + 32) {
+            uint32_t n_evict = 32;
+            for (uint32_t il = 0; il < layers.size(); ++il) {
+                auto & layer = layers[il];
+                if (!layer.k || !layer.k_quant) continue;
+                
+                ggml_tensor * k_recent = layer.k_stream[s];
+                ggml_tensor * k_quant = layer.k_quant_stream[s];
+                uint32_t k_embd = k_recent->ne[0];
+                size_t k_recent_row_size = k_recent->nb[1];
+                size_t k_quant_row_size = k_quant->nb[1];
+
+                std::vector<float> x(k_embd);
+
+                for (uint32_t t = 0; t < n_evict; t++) {
+                    ggml_fp16_t * src_ptr = (ggml_fp16_t *) ((char*)k_recent->data + t * k_recent_row_size);
+                    for (uint32_t f = 0; f < k_embd; f++) {
+                        x[f] = ggml_fp16_to_fp32(src_ptr[f]);
+                    }
+                    block_kivi_2 * dst_ptr = (block_kivi_2 *) ((char*)k_quant->data + (k_quant_count[s] + t) * k_quant_row_size);
+                    quantize_row_kivi_2_ref(x.data(), dst_ptr, k_embd);
+                }
+
+                uint32_t n_remain = k_recent_count[s] - n_evict;
+                if (n_remain > 0) {
+                    memmove(k_recent->data, (char*)k_recent->data + n_evict * k_recent_row_size, n_remain * k_recent_row_size);
+                }
+            }
+            k_quant_count[s] += n_evict;
+            k_recent_count[s] -= n_evict;
+        }
+    }
+
     if (!sc_info.empty()) {
         assert(n_stream > 1 && "stream copy should never happen with a single stream");
 
@@ -911,6 +955,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        k_recent_count[sinfo.strm[s]] += sinfo.size();
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
             const uint32_t i = s*sinfo.size() + ii;
 
@@ -1031,13 +1076,39 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t m_quant = k_quant_count[sinfo.strm[0]];
+    const uint32_t n_recent_unbounded = n_kv > m_quant ? n_kv - m_quant : 0;
+    const uint32_t n_recent = std::min(n_recent_unbounded, (uint32_t)k->ne[1]);
 
     return ggml_view_4d(ctx, k,
-            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_recent, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*k->ne[1]),
+            ggml_row_size(k->type, n_embd_k_gqa*k->ne[1])*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_k_quant(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    auto * k_quant = layers[ikv].k_quant;
+
+    if (!k_quant) return nullptr;
+
+    const uint64_t kv_size      = get_size();
+    const uint64_t n_embd_k_gqa = k_quant->ne[0];
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t m_quant = k_quant_count[sinfo.strm[0]];
+    
+    if (m_quant == 0) return nullptr;
+
+    return ggml_view_4d(ctx, k_quant,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), m_quant, ns,
+            ggml_row_size(k_quant->type, hparams.n_embd_head_k(il)),
+            ggml_row_size(k_quant->type, n_embd_k_gqa),
+            ggml_row_size(k_quant->type, n_embd_k_gqa*kv_size),
+            ggml_row_size(k_quant->type, n_embd_k_gqa*kv_size)*sinfo.s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1094,13 +1165,13 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_stream = k->ne[2];
 
     if (n_stream > 1) {
-        const int64_t kv_size = get_size();
+        const uint32_t k_size = std::min((uint32_t)get_size(), residual_window + 32);
 
         assert(n_embd_gqa == k->ne[0]);
-        assert(kv_size    == k->ne[1]);
+        assert(k_size     == k->ne[1]);
 
         // merge the buffer across all streams because the idxs are global
-        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+        k = ggml_reshape_2d(ctx, k, n_embd_gqa, k_size*n_stream);
     }
 
     // store the current K values into the cache
@@ -1197,10 +1268,13 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     int64_t * data = (int64_t *) dst->data;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const int64_t offs = sinfo.strm[s]*get_size();
+        const uint32_t k_size = std::min((uint32_t)get_size(), residual_window + 32);
+        const int64_t offs = sinfo.strm[s]*k_size;
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            int64_t logical_idx = sinfo.idxs[s][i];
+            int64_t physical_idx = logical_idx - k_quant_count[s];
+            data[s*sinfo.size() + i] = offs + physical_idx;
         }
     }
 }
@@ -2241,7 +2315,13 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    const auto & sinfo = sinfos[i_cur];
+    return kv->get_k(ctx, il, n_kv, sinfo);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_quant(ggml_context * ctx, int32_t il) const {
+    const auto & sinfo = sinfos[i_cur];
+    return kv->get_k_quant(ctx, il, n_kv, sinfo);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
