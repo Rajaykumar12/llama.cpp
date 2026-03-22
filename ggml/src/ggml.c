@@ -731,8 +731,8 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK_KIVI_2,
         .type_size                = sizeof(block_kivi_2),
         .is_quantized             = true,
-        .to_float                 = NULL,  // TODO: implement dequantize_row_kivi_2
-        .from_float_ref           = NULL,  // TODO: implement quantize_row_kivi_2_ref
+        .to_float                 = (ggml_to_float_t) dequantize_row_kivi_2,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_kivi_2_ref,
     },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",

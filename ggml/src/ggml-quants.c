@@ -494,6 +494,79 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// ============================ KIVI_2: 2-bit asymmetric KV cache quantization
+// Block: 32 values → 12 bytes (2B scale d, 2B zero-point m, 8B packed 2-bit data)
+// Formula: q = clamp(round((x - min) / scale), 0, 3)  where scale = (max - min) / 3
+//          x' = q * d + m
+//
+// Packing: 4 consecutive 2-bit quants packed into one byte, LSB first:
+//   byte = (q[0] & 0x3) | ((q[1] & 0x3) << 2) | ((q[2] & 0x3) << 4) | ((q[3] & 0x3) << 6)
+
+void quantize_row_kivi_2_ref(const float * GGML_RESTRICT x, block_kivi_2 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_KIVI_2;  // 32
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float min_val = FLT_MAX;
+        float max_val = -FLT_MAX;
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (v < min_val) min_val = v;
+            if (v > max_val) max_val = v;
+        }
+
+        // Handle degenerate case (all same value)
+        const float range = max_val - min_val;
+        const float d = range > 0.0f ? range / 3.0f : 0.0f;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+        y[i].m = GGML_FP32_TO_FP16(min_val);
+
+        // Pack 4 values per byte (2 bits each), 8 bytes total for 32 values
+        for (int j = 0; j < qk/4; j++) {
+            const int base = i*qk + j*4;
+
+            // Quantize 4 consecutive values
+            const uint8_t q0 = (uint8_t) MAX(0, MIN(3, (int32_t)roundf((x[base + 0] - min_val) * id)));
+            const uint8_t q1 = (uint8_t) MAX(0, MIN(3, (int32_t)roundf((x[base + 1] - min_val) * id)));
+            const uint8_t q2 = (uint8_t) MAX(0, MIN(3, (int32_t)roundf((x[base + 2] - min_val) * id)));
+            const uint8_t q3 = (uint8_t) MAX(0, MIN(3, (int32_t)roundf((x[base + 3] - min_val) * id)));
+
+            y[i].qs[j] = (q0 & 0x3) | ((q1 & 0x3) << 2) | ((q2 & 0x3) << 4) | ((q3 & 0x3) << 6);
+        }
+    }
+}
+
+void dequantize_row_kivi_2(const block_kivi_2 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_KIVI_2;  // 32
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
+
+        // Unpack 4 values per byte
+        for (int j = 0; j < qk/4; j++) {
+            const uint8_t byte = x[i].qs[j];
+            const int base = i*qk + j*4;
+
+            y[base + 0] = ((byte       ) & 0x3) * d + m;
+            y[base + 1] = ((byte >> 2  ) & 0x3) * d + m;
+            y[base + 2] = ((byte >> 4  ) & 0x3) * d + m;
+            y[base + 3] = ((byte >> 6  ) & 0x3) * d + m;
+        }
+    }
+}
+
+
 //
 // 2-6 bit quantization in super-blocks
 //

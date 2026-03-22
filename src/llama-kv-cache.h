@@ -160,6 +160,7 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k_quant(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
@@ -213,6 +214,10 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // KIVI_2 streaming tensors and tracked counts
+        ggml_tensor * k_quant;
+        std::vector<ggml_tensor *> k_quant_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -225,6 +230,9 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    // KIVI_2 residual window size
+    const uint32_t residual_window = 64;
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
@@ -246,6 +254,10 @@ private:
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
+
+    // kivi_2 counts
+    std::vector<uint32_t> k_recent_count;
+    std::vector<uint32_t> k_quant_count;
 
     std::vector<kv_layer> layers;
 
@@ -330,6 +342,7 @@ public:
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_quant(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location

@@ -838,4 +838,82 @@ static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restr
     }
 }
 
+// ====================== KIVI_2: 2-bit asymmetric dequantization (SYCL GPU)
+// Element-wise kernel: for use with the generic dequantize_block<qk, qr, ...> template
+// Each call extracts 4 consecutive values from one byte at iqs
+// Note: QR_KIVI_2 = 4 (4 values packed per byte), so iqs strides by 1 byte (4 values)
+static __dpct_inline__ void dequantize_kivi_2(const void *vx, const int64_t ib,
+                                              const int iqs, dfloat2 &v) {
+    const block_kivi_2 * x = (const block_kivi_2 *) vx;
+    const dfloat d = x[ib].d;
+    const dfloat m = x[ib].m;
+
+    // iqs is a byte index into qs; extract bits 0-1 and bits 2-3 from that byte
+    const int byte_val = x[ib].qs[iqs];
+    v.x() = (float)((byte_val     ) & 0x3);
+    v.y() = (float)((byte_val >> 2) & 0x3);
+
+#ifdef GGML_SYCL_F16
+    v.s0() = sycl::fma(v.s0(), d, m);
+    v.s1() = sycl::fma(v.s1(), d, m);
+#else
+    v.x() = sycl::fma(v.x(), d, m);
+    v.y() = sycl::fma(v.y(), d, m);
+#endif
+}
+
+// Block-level kernel: 32 threads per block, each thread handles one byte (4 packed 2-bit values)
+// Each block of 32 values occupies 8 bytes; use 8 threads per block-of-32, 32 per QK_KIVI_2
+// We launch with (nb*1) groups of 8 threads to cover nb blocks of 32 values.
+// For simplicity, mirror dequantize_block_q4_1 pattern (8 blocks per group, 32 threads):
+//   group i processes 8 blocks, thread tid = il*8+ir → block ib = 8*i+ir, byte il
+template<typename dst_t>
+static void dequantize_block_kivi_2(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                    int64_t nb32,
+                                    const sycl::nd_item<3> &item_ct1) {
+    const int64_t i = item_ct1.get_group(2);      // Group index
+    const int64_t tid = item_ct1.get_local_id(2); // Thread index in group (0..31)
+
+    // Using the 32-thread pattern from q4_1:
+    // 1 group = 32 threads = 8 blocks of 32 values
+    // Each thread processes 8 values (2 bytes) in q4_1. 
+    // For KIVI_2, 8 values = 2 bytes. So the same threading works perfectly.
+    const int64_t il = tid / 8; // byte pair index within a block's 8 bytes (0..3)
+    const int64_t ir = tid % 8; // block index within this group (0..7)
+    const int64_t ib = 8 * i + ir; // Absolute block index
+
+    if (ib >= nb32) {
+        return;
+    }
+
+    // yy points to the start of the output tensor.
+    // Group offset = 256*i (8 blocks * 32 vals)
+    // Block offset within group = 32*ir
+    // Thread offset within block = 8*il (each thread handles 8 consecutive values)
+    dst_t * y = yy + 256*i + 32*ir + 8*il;
+
+    const block_kivi_2 * x = (const block_kivi_2 *)vx + ib;
+
+    // Load FP16 scale and zero-point and convert to float
+    const float d = sycl::vec<sycl::half, 1>(x->d).convert<float, sycl::rounding_mode::automatic>()[0];
+    const float m = sycl::vec<sycl::half, 1>(x->m).convert<float, sycl::rounding_mode::automatic>()[0];
+
+    // Read the two bytes for this thread
+    const uint8_t * q = x->qs + 2 * il;
+    const uint8_t byte0 = q[0];
+    const uint8_t byte1 = q[1];
+
+    // Unpack 4 values from byte0
+    y[0] = d * (float)((byte0     ) & 0x3) + m;
+    y[1] = d * (float)((byte0 >> 2) & 0x3) + m;
+    y[2] = d * (float)((byte0 >> 4) & 0x3) + m;
+    y[3] = d * (float)((byte0 >> 6) & 0x3) + m;
+
+    // Unpack 4 values from byte1
+    y[4] = d * (float)((byte1     ) & 0x3) + m;
+    y[5] = d * (float)((byte1 >> 2) & 0x3) + m;
+    y[6] = d * (float)((byte1 >> 4) & 0x3) + m;
+    y[7] = d * (float)((byte1 >> 6) & 0x3) + m;
+}
+
 #endif // GGML_SYCL_DEQUANTIZE_HPP

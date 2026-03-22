@@ -133,8 +133,9 @@ void test_compression_ratio() {
     printf("KIVI_2 compressed: %zu bytes (%d blocks × 12 bytes)\n", compressed_bytes, num_blocks);
     printf("Compression ratio: %.2f× (%.1f%% savings)\n", compression_ratio, savings_percent);
     
-    // Expected: 5.3× compression, ~81% savings
-    const double expected_ratio = 5.3;
+    // Expected: 10.67× compression, ~90.6% savings (F32 -> KIVI_2)
+    // 32 F32 values = 128 bytes. 1 KIVI_2 block = 12 bytes. 128 / 12 = 10.666...
+    const double expected_ratio = 10.666666666666666;
     const double tolerance = 0.05;  // 5% tolerance
     
     if (std::abs(compression_ratio - expected_ratio) / expected_ratio < tolerance) {

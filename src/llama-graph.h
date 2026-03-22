@@ -868,6 +868,7 @@ struct llm_graph_context {
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * k_quant, // new dual precision tensor
             ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans == false)
             ggml_tensor * kq_b,
             ggml_tensor * kq_mask,
